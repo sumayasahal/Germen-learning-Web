@@ -1,0 +1,149 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    // Role is read from users/{uid}.role (students cannot change it).
+    // Set role = 'admin' or 'teacher' manually in Firebase Console.
+    function role() {
+      return signedIn()
+        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', '')
+        : '';
+    }
+    function isAdmin() {
+      return role() == 'admin';
+    }
+    function isStaff() {
+      return role() in ['admin', 'teacher'];
+    }
+    // Active, non-expired entitlement for a product (doc id: uid_productId)
+    function hasAccess(productId) {
+      let e = /databases/$(database)/documents/entitlements/$(request.auth.uid + '_' + productId);
+      return exists(e)
+        && get(e).data.get('active', false) == true
+        && get(e).data.get('expiresAt', request.time) > request.time;
+    }
+
+    // Branding: public read, admin write
+    match /appConfig/{doc} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Users: students can only change name / lang / lastActive.
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isStaff());
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.role == 'student'
+        && request.resource.data.xp == 0
+        && request.resource.data.streak == 0;
+      allow update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['name', 'lang', 'lastActive']);
+      allow update: if isAdmin();
+    }
+
+    // Plans and prices are public (shown on the landing page)
+    match /products/{id} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+
+    // Content tree: levels > units > lessons (titles only) > content/steps
+    // NOTE: "resource.data.published == true" (no .get) so list queries
+    // with where('published', isEqualTo: true) are allowed for students.
+    match /levels/{levelId} {
+      allow read: if signedIn() && (resource.data.published == true || isStaff());
+      allow write: if isStaff();
+
+      match /units/{unitId} {
+        allow read: if signedIn() && (resource.data.published == true || isStaff());
+        allow write: if isStaff();
+
+        // Unit review video link (protected like lesson content)
+        match /content/{docId} {
+          allow read: if isStaff() || (
+            signedIn()
+            && get(/databases/$(database)/documents/levels/$(levelId)/units/$(unitId)).data.get('published', false) == true
+            && hasAccess(get(/databases/$(database)/documents/levels/$(levelId)).data.get('productId', ''))
+          );
+          allow write: if isStaff();
+        }
+
+        match /lessons/{lessonId} {
+          allow read: if signedIn() && (resource.data.published == true || isStaff());
+          allow write: if isStaff();
+
+          // The real lesson content. Free lessons are open to signed-in users;
+          // others need an active entitlement for the level's product.
+          match /content/{docId} {
+            allow read: if isStaff() || (
+              signedIn()
+              && get(/databases/$(database)/documents/levels/$(levelId)/units/$(unitId)/lessons/$(lessonId)).data.get('published', false) == true
+              && (
+                get(/databases/$(database)/documents/levels/$(levelId)/units/$(unitId)/lessons/$(lessonId)).data.get('free', false) == true
+                || hasAccess(get(/databases/$(database)/documents/levels/$(levelId)).data.get('productId', ''))
+              )
+            );
+            allow write: if isStaff();
+          }
+        }
+      }
+    }
+
+    // Exam practice: meta is listed for signed-in users, content is protected
+    match /exams/{examId} {
+      allow read: if signedIn() && (resource.data.published == true || isStaff());
+      allow write: if isStaff();
+
+      match /content/{docId} {
+        allow read: if isStaff() || (
+          signedIn()
+          && get(/databases/$(database)/documents/exams/$(examId)).data.get('published', false) == true
+          && (
+            get(/databases/$(database)/documents/exams/$(examId)).data.get('free', false) == true
+            || hasAccess(get(/databases/$(database)/documents/exams/$(examId)).data.get('productId', 'exam-a1'))
+          )
+        );
+        allow write: if isStaff();
+      }
+    }
+
+    // Exam results: a student saves and reads only their own
+    match /examResults/{id} {
+      allow read: if signedIn() && (resource.data.uid == request.auth.uid || isStaff());
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+    }
+
+    // Entitlements: doc id is uid_productId
+    match /entitlements/{id} {
+      allow read: if signedIn() && (id.matches(request.auth.uid + '_.*') || isStaff());
+      allow write: if isStaff();
+    }
+
+    // Progress: own docs only (doc id starts with uid_)
+    match /progress/{id} {
+      // direct field check so list queries (where uid == me) are allowed
+      allow read: if signedIn() && (resource.data.uid == request.auth.uid || isStaff());
+      allow create, update: if signedIn()
+        && request.resource.data.get('uid', '') == request.auth.uid
+        && id.matches(request.auth.uid + '_.*');
+    }
+
+    // Payment requests: a student creates a pending request; staff approve.
+    match /paymentRequests/{id} {
+      allow read: if signedIn() && (resource.data.uid == request.auth.uid || isStaff());
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'pending';
+      allow update, delete: if isStaff();
+    }
+
+    match /payments/{id} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+  }
+}
